@@ -162,6 +162,7 @@ class PreparedQuestion:
     choices: list[str]
     answer: str
     images: list[Path]
+    answer_images: list[Path]
     solution_space: float
 
 
@@ -1381,11 +1382,14 @@ class WordExamBuilder:
         image_layouts: dict | None = None,
         list_depth: int = 0,
         list_kind_depths: tuple[int, int] = (0, 0),
+        max_image_width: float = 4.8,
+        max_image_height: float = 2.8,
+        keep_text_with_next_image: bool = False,
     ) -> None:
         segments = _split_content_segments(content)
         paragraph = first_paragraph
         has_output = False
-        for kind, first_value, second_value in segments:
+        for index, (kind, first_value, second_value) in enumerate(segments):
             if kind == "list":
                 self._add_latex_list(
                     first_value, parent=parent, depth=list_depth,
@@ -1429,9 +1433,19 @@ class WordExamBuilder:
                     else:
                         paragraph.paragraph_format.first_line_indent = Cm(0.74)
                     paragraph.paragraph_format.space_after = Pt(2)
+            if keep_text_with_next_image and not IMAGE_PATTERN.search(part):
+                # 列表/表格块的 first_value 不是字符串，只检查后续文本段落。
+                if any(
+                    isinstance(value, str) and IMAGE_PATTERN.search(value)
+                    for _, value, _ in segments[index + 1:]
+                ):
+                    paragraph.paragraph_format.keep_with_next = True
             if IMAGE_PATTERN.fullmatch(part.strip()):
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            self.add_mixed(paragraph, part, images=images, image_layouts=image_layouts)
+            self.add_mixed(
+                paragraph, part, images=images, image_layouts=image_layouts,
+                max_image_width=max_image_width, max_image_height=max_image_height,
+            )
             has_output = True
 
     def _new_list_numbering(self, environment: str, depth: int, kind_depth: int) -> int:
@@ -1834,8 +1848,10 @@ class WordExamBuilder:
             _set_run_font(run, BODY_FONT_SIZE, bold=True)
             if item.answer.strip():
                 self._add_content_blocks(
-                    p, item.answer, images=item.images,
+                    p, item.answer, images=item.answer_images,
                     image_layouts=item.question.get("image_layouts"),
+                    max_image_width=6.1, max_image_height=7.0,
+                    keep_text_with_next_image=True,
                 )
             else:
                 run = p.add_run("暂无答案与解析。")
@@ -2004,11 +2020,17 @@ def _prepare_question(item: dict, uploads_dir: str | Path | None) -> PreparedQue
         stem = "\n".join(stem_lines).strip()
     stem = re.sub(r"\\begin\{tikzpicture\}[\s\S]*?\\end\{tikzpicture\}", "", stem).strip()
     answer = question.get("answer_markdown", "") or ""
-    answer_tables = find_markdown_tables(answer)
-    answer_clean = IMAGE_PATTERN.sub(
-        lambda image: image.group(0) if any(table.start <= image.start() < table.end
-                                          for table in answer_tables) else "", answer)
-    answer_clean = re.sub(r"\\begin\{tikzpicture\}[\s\S]*?\\end\{tikzpicture\}", "", answer_clean).strip()
+    # Preserve the answer images at their original positions and in order.
+    answer_clean = re.sub(r"\\begin\{tikzpicture\}[\s\S]*?\\end\{tikzpicture\}", "", answer).strip()
+    all_images = _resolve_image_paths(question, uploads_dir)
+    content_image_names = {Path(value).name for value in IMAGE_PATTERN.findall(content)}
+    answer_image_names = {Path(value).name for value in IMAGE_PATTERN.findall(answer_clean)}
+    # Keep unanchored legacy stem attachments while excluding answer-only images.
+    stem_images = [
+        path for path in all_images
+        if path.name not in answer_image_names or path.name in content_image_names
+    ]
+    answer_images = [path for path in all_images if path.name in answer_image_names]
     solution_space = item_solution_space_cm(item, question)
     return PreparedQuestion(
         question=question,
@@ -2016,7 +2038,8 @@ def _prepare_question(item: dict, uploads_dir: str | Path | None) -> PreparedQue
         stem=stem,
         choices=choices,
         answer=answer_clean,
-        images=_resolve_image_paths(question, uploads_dir),
+        images=stem_images,
+        answer_images=answer_images,
         solution_space=solution_space,
     )
 
@@ -2092,9 +2115,10 @@ def build_word_document(
             next_number = current
 
     if include_answers:
-        answer_items = prepared if paper_type == "exam_19" else ordered_items
-        ordered_numbers = [number_by_object.get(id(item), index + 1) for index, item in enumerate(answer_items)]
-        builder.add_answers(answer_items, ordered_numbers, title)
+        # 答案解析必须与卷面题号同序：即使 exam_19 按题型固定起始题号重新分组，
+        # 也不能回退到购物车的原始选题顺序，否则答案号会出现 15、1、2、12 之类的乱序。
+        ordered_numbers = [number_by_object[id(item)] for item in ordered_items]
+        builder.add_answers(ordered_items, ordered_numbers, title)
 
     output = _with_content_sources_docx_property(builder.save_bytes(), content_sources_notice())
     if diagnostics.fallback_formulas:

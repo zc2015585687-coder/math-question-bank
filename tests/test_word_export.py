@@ -1,4 +1,5 @@
 import io
+import re
 import shutil
 import zipfile
 from pathlib import Path
@@ -15,6 +16,17 @@ from mathbank.word_export_helper import MathToken, build_word_document, tokenize
 def _document_xml(docx_bytes: bytes) -> bytes:
     with zipfile.ZipFile(io.BytesIO(docx_bytes), "r") as archive:
         return archive.read("word/document.xml")
+
+
+def _paragraph_texts(docx_bytes: bytes) -> list[str]:
+    root = etree.fromstring(_document_xml(docx_bytes))
+    namespaces = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    }
+    return [
+        "".join(node.xpath(".//w:t/text()", namespaces=namespaces))
+        for node in root.xpath(".//w:body/w:p", namespaces=namespaces)
+    ]
 
 
 def _package_part(docx_bytes: bytes, name: str) -> bytes:
@@ -985,3 +997,123 @@ def test_create_word_bundle_zip():
         assert archive.namelist() == ["高一数学月考.docx", "高一数学月考_含答案与解析.docx", "content_sources.json", "CONTENT_SOURCES.txt"]
         assert archive.read("高一数学月考.docx") == main_bytes
         assert archive.read("高一数学月考_含答案与解析.docx") == ans_bytes
+
+@pytest.mark.parametrize('include_answers', [False, True])
+def test_word_export_separates_original_answer_images_from_student_questions(tmp_path, include_answers):
+    colors = {'stem.png': 'red', 'answer-a.png': 'blue', 'answer-b.png': 'green', 'legacy.png': 'yellow'}
+    for name, color in colors.items():
+        Image.new('RGB', (120, 180), color).save(tmp_path / name)
+    data, diagnostics = build_word_document(
+        '原图题答案隔离', '', 'quiz', [{
+            'question': {
+                'id': 1, 'question_type': 'detailed_answer',
+                'content': '题干开始。\n\n![原题](/static/uploads/stem.png)\n\n题干结束。',
+                'answer_markdown': (
+                    '原题定位。\n\n![解析第一页](/static/uploads/answer-a.png)\n\n'
+                    '继续讲解。\n\n![沿用题图](/static/uploads/stem.png)\n\n'
+                    '![解析第二页](/static/uploads/answer-b.png)\n\n'
+                    '![再次引用第一页](/static/uploads/answer-a.png)'
+                ),
+                'image_paths': ['/static/uploads/answer-b.png', '/static/uploads/legacy.png',
+                                '/static/uploads/stem.png', '/static/uploads/answer-a.png'],
+                'figure_align': 'center',
+            }, 'score': 10,
+        }], include_answers=include_answers, uploads_dir=tmp_path,
+    )
+    ns = {'w': word_export_helper.WORD_NS,
+          'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+          'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        document = etree.fromstring(archive.read('word/document.xml'))
+        rels = etree.fromstring(archive.read('word/_rels/document.xml.rels'))
+        targets = {r.get('Id'): r.get('Target') for r in rels}
+        body = document.find('w:body', ns)
+        question_images, answer_images = [], []
+        in_answers = False
+        for node in body:
+            if '参考答案与解析' in ''.join(node.xpath('.//w:t/text()', namespaces=ns)):
+                in_answers = True
+            for rid in node.xpath('.//a:blip/@r:embed', namespaces=ns):
+                with Image.open(io.BytesIO(archive.read('word/' + targets[rid]))) as im:
+                    color = im.convert('RGB').getpixel((0, 0))
+                (answer_images if in_answers else question_images).append(color)
+    assert question_images == [(255, 0, 0), (255, 255, 0)]
+    assert answer_images == ([(0, 0, 255), (255, 0, 0), (0, 128, 0), (0, 0, 255)] if include_answers else [])
+    assert diagnostics['missing_images'] == 0
+
+
+def test_word_export_reports_missing_original_answer_image(tmp_path):
+    _, diagnostics = build_word_document('缺失解析图', '', 'quiz', [{
+        'question': {'id': 1, 'question_type': 'detailed_answer', 'content': '原题。',
+                     'answer_markdown': '![原解析](/static/uploads/missing-answer.png)',
+                     'image_paths': ['/static/uploads/missing-answer.png']},
+        'score': 5,
+    }], include_answers=True, uploads_dir=tmp_path)
+    assert diagnostics['missing_images'] == 1
+    assert any('missing-answer.png' in warning for warning in diagnostics['warnings'])
+
+
+def test_exam_19_answer_section_follows_paper_order():
+    """exam_19 重排题型后，答案解析仍须按卷面题号顺序输出。"""
+
+    items = [
+        {
+            "question": {
+                "id": 3,
+                "question_type": "detailed_answer",
+                "content": "解答题题干",
+                "answer_markdown": "解答题解析",
+                "image_paths": [],
+            },
+            "score": 12,
+        },
+        {
+            "question": {
+                "id": 1,
+                "question_type": "single_choice",
+                "content": "选择题题干",
+                "answer_markdown": "选择题解析",
+                "image_paths": [],
+            },
+            "score": 5,
+        },
+        {
+            "question": {
+                "id": 2,
+                "question_type": "fill_in_blank",
+                "content": "填空题题干",
+                "answer_markdown": "填空题解析",
+                "image_paths": [],
+            },
+            "score": 5,
+        },
+    ]
+
+    data, _ = build_word_document(
+        "答案顺序回归",
+        "",
+        "exam_19",
+        items,
+        include_answers=True,
+        show_secret=False,
+        show_notice=False,
+    )
+    texts = _paragraph_texts(data)
+
+    paper_section = texts[: next(index for index, text in enumerate(texts) if "参考答案与解析" in text)]
+    assert [text for text in paper_section if text.endswith("题干")] == [
+        "1. 选择题题干",
+        "12. 填空题题干",
+        "15. 解答题题干",
+    ]
+
+    answer_texts = texts[len(paper_section) + 1 :]
+    numbers = []
+    answers = []
+    for text in answer_texts:
+        match = re.match(r"^(\d+)\.\s*(.*)$", text)
+        if match:
+            numbers.append(int(match.group(1)))
+            answers.append(match.group(2))
+    assert numbers == [1, 12, 15]
+    assert answers == ["选择题解析", "填空题解析", "解答题解析"]
